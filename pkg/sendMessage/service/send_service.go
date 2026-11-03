@@ -1091,6 +1091,9 @@ func (s *sendService) sendMediaFileWithRetry(data *MediaStruct, fileData []byte,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
 				}}
 			}
+			if !isNewsletter {
+				addVideoPreview(media.VideoMessage, fileData)
+			}
 			mediaType = "VideoMessage"
 		case "ptv":
 			if isNewsletter {
@@ -1390,6 +1393,9 @@ func (s *sendService) sendMediaUrlWithRetry(data *MediaStruct, instance *instanc
 					FileSHA256:    uploaded.FileSHA256,
 					FileLength:    proto.Uint64(uint64(len(fileData))),
 				}}
+			}
+			if !isNewsletter {
+				addVideoPreview(media.VideoMessage, fileData)
 			}
 			mediaType = "VideoMessage"
 		case "ptv":
