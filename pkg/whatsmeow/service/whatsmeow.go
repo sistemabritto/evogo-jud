@@ -1834,7 +1834,15 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		// Opt-in capture of on-demand history responses. The webhook consumer may
 		// ignore HistorySync, and these payloads carry the media keys needed to
 		// re-download old attachments through /message/downloadmedia.
-		if dumpDir := os.Getenv("HISTORY_SYNC_DUMP_DIR"); dumpDir != "" && evt.Data.GetSyncType().String() == "ON_DEMAND" {
+		// HISTORY_SYNC_DUMP_INSTANCES (comma-separated instance names) also captures
+		// the initial/recent sync of a freshly paired recovery device.
+		dumpAll := false
+		for _, n := range strings.Split(os.Getenv("HISTORY_SYNC_DUMP_INSTANCES"), ",") {
+			if n = strings.TrimSpace(n); n != "" && mycli.Instance != nil && n == mycli.Instance.Name {
+				dumpAll = true
+			}
+		}
+		if dumpDir := os.Getenv("HISTORY_SYNC_DUMP_DIR"); dumpDir != "" && (dumpAll || evt.Data.GetSyncType().String() == "ON_DEMAND") {
 			if raw, err := json.Marshal(evt); err != nil {
 				mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] history sync dump marshal: %v", mycli.userID, err)
 			} else if err := os.MkdirAll(dumpDir, 0o700); err != nil {
@@ -1844,7 +1852,7 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 				if err := os.WriteFile(name, raw, 0o600); err != nil {
 					mycli.loggerWrapper.GetLogger(mycli.userID).LogError("[%s] history sync dump write: %v", mycli.userID, err)
 				} else {
-					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] On-demand history sync saved (%d conversations)", mycli.userID, len(evt.Data.GetConversations()))
+					mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] History sync saved (%s, %d conversations)", mycli.userID, evt.Data.GetSyncType().String(), len(evt.Data.GetConversations()))
 				}
 			}
 		}
