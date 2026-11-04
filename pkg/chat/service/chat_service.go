@@ -234,7 +234,11 @@ func (c *chatService) HistorySyncRequest(data *HistorySyncRequestStruct, instanc
 
 	histRequest := client.BuildHistorySyncRequest(&messageInfo, data.Count)
 
-	res, err := client.SendMessage(context.Background(), messageInfo.Chat, histRequest, whatsmeow.SendRequestExtra{Peer: true})
+	// The on-demand history request is a peer message for the account's own
+	// primary device. Sending it to messageInfo.Chat would address the
+	// contact's devices instead, so it must go through SendPeerMessage,
+	// which targets the logged-in user's own JID.
+	res, err := client.SendPeerMessage(context.Background(), histRequest)
 	if err != nil {
 		c.loggerWrapper.GetLogger(instance.Id).LogError("[%s] error history sync request: %v", instance.Id, err)
 		return nil, err
