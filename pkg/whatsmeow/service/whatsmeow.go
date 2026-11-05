@@ -301,6 +301,42 @@ func (w whatsmeowService) ForceUpdateJid(instanceId string, number string) error
 	return nil
 }
 
+// Cramer: um único sqlstore.Container por banco, reaproveitado por todas as instâncias.
+// Antes, cada StartClient (início e cada reconexão) abria um pool novo com sqlstore.New
+// que nunca era fechado; as conexões ociosas se acumulavam no Postgres (84 em 23 h numa
+// VPS com 2 instâncias) até o limite de 100. O container suporta vários devices, então
+// compartilhar é o uso previsto pela whatsmeow.
+var (
+	sharedStoreMu sync.Mutex
+	sharedStores  = map[string]*sqlstore.Container{}
+)
+
+func sharedContainer(dialect, address string, log waLog.Logger) (*sqlstore.Container, error) {
+	sharedStoreMu.Lock()
+	defer sharedStoreMu.Unlock()
+	key := dialect + "|" + address
+	if c, ok := sharedStores[key]; ok {
+		return c, nil
+	}
+	db, err := sql.Open(dialect, address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	if dialect == "postgres" {
+		db.SetMaxOpenConns(20)
+		db.SetMaxIdleConns(4)
+		db.SetConnMaxIdleTime(5 * time.Minute)
+		db.SetConnMaxLifetime(30 * time.Minute)
+	}
+	c := sqlstore.NewWithDB(db, dialect, log)
+	if err := c.Upgrade(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("failed to upgrade database: %w", err)
+	}
+	sharedStores[key] = c
+	return c, nil
+}
+
 func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Starting websocket connection to Whatsapp for user '%s'", cd.Instance.Id)
@@ -319,17 +355,17 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	if w.config.WaDebug != "" {
 		dbLog := waLog.Stdout("Database", w.config.WaDebug, true)
 		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, dbLog)
+			container, err = sharedContainer("postgres", w.config.PostgresAuthDB, dbLog)
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, dbLog)
+			container, err = sharedContainer("sqlite", dsn, dbLog)
 		}
 	} else {
 		if w.config.PostgresAuthDB != "" {
-			container, err = sqlstore.New(context.Background(), "postgres", w.config.PostgresAuthDB, nil)
+			container, err = sharedContainer("postgres", w.config.PostgresAuthDB, nil)
 		} else {
 			dsn := fmt.Sprintf("file:%s/dbdata/main.db?_pragma=foreign_keys(1)&_busy_timeout=5000&cache=shared&mode=rwc&_journal_mode=WAL", w.exPath)
-			container, err = sqlstore.New(context.Background(), "sqlite", dsn, nil)
+			container, err = sharedContainer("sqlite", dsn, nil)
 		}
 	}
 
