@@ -27,8 +27,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: excarplex/evolution-go
+          images: |
+            excarplex/evogo-jud
+            excarplex/evolution-go
           tags: |
+            type=sha,prefix=
+            type=raw,value=latest
             type=sha,prefix=sistemabritto-
             type=raw,value=sistemabritto
 
