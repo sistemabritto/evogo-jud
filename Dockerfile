@@ -11,17 +11,12 @@ COPY go.mod go.sum ./
 # não há mais submódulo whatsmeow-lib para copiar.
 RUN go mod download
 
-# The 0.7.2 client version is rejected by WhatsApp (405). Keep the
-# pinned dependency and apply the previously validated compatibility patch.
-RUN cp -a /go/pkg/mod/go.mau.fi/whatsmeow@v0.0.0-20260630180629-b572e5bcb92b /tmp/whatsmeow \
-    && chmod -R u+w /tmp/whatsmeow \
-    && grep -q "WAVersionContainer{2, 3000, 1042386815}" /tmp/whatsmeow/store/clientpayload.go \
-    && sed -i "s/WAVersionContainer{2, 3000, 1042386815}/WAVersionContainer{2, 3000, 1052556849}/" /tmp/whatsmeow/store/clientpayload.go \
-    && test -f /tmp/whatsmeow/go.mod
+# Sem patch de versão: o whatsmeow f1b798561919 já traz WAVersionContainer
+# {2, 3000, 1052556849} (o valor que o patch antigo forçava), e o Evolution
+# ainda busca a versão atual do WhatsApp Web ao conectar.
 
 # Copiar o restante do código
 COPY . .
-RUN go mod edit -replace=go.mau.fi/whatsmeow=/tmp/whatsmeow
 
 ARG VERSION=dev
 RUN CGO_ENABLED=1 go build -ldflags "-X main.version=${VERSION}" -o server ./cmd/evolution-go
