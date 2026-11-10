@@ -171,6 +171,38 @@ type ProxyConfig struct {
 	Username string `json:"username"`
 }
 
+// Cramer: histórico de reconexões automáticas por instância (para o backoff).
+var (
+	reconnectMu      sync.Mutex
+	reconnectHistory = map[string][]time.Time{}
+)
+
+const reconnectWindow = 10 * time.Minute
+
+// reconnectBackoff registra uma reconexão automática e devolve quanto esperar antes
+// dela: 0 se for a primeira na janela; depois 15s, 30s, 60s, 120s, 240s, máx. 5 min.
+func reconnectBackoff(instanceID string) time.Duration {
+	reconnectMu.Lock()
+	defer reconnectMu.Unlock()
+	now := time.Now()
+	recent := reconnectHistory[instanceID][:0]
+	for _, t := range reconnectHistory[instanceID] {
+		if now.Sub(t) < reconnectWindow {
+			recent = append(recent, t)
+		}
+	}
+	n := len(recent)
+	reconnectHistory[instanceID] = append(recent, now)
+	if n == 0 {
+		return 0
+	}
+	delay := 15 * time.Second << (n - 1)
+	if n > 6 || delay > 5*time.Minute {
+		delay = 5 * time.Minute
+	}
+	return delay
+}
+
 func (w whatsmeowService) ReconnectClient(instanceId string) error {
 	w.loggerWrapper.GetLogger(instanceId).LogInfo("[%s] Starting reconnection process - simulating restart", instanceId)
 
@@ -608,14 +640,25 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 	// Removed auto-reconnect logic to prevent infinite loops
 
+	// Cramer: cada StartClient escuta o PRÓPRIO canal de kill. Antes o select lia
+	// w.killChannel[id] a cada volta; depois de um ReconnectClient (que apaga e recria
+	// o canal) a goroutine antiga passava a disputar o canal do cliente novo e, ao
+	// ganhar, reiniciava um segundo cliente para o mesmo aparelho. Dois clientes no
+	// mesmo device derrubam um ao outro: ~950 desconexões/h em 09/11 (risco de ban).
+	kill := w.killChannel[cd.Instance.Id]
+
 	for {
 		select {
-		case <-w.killChannel[cd.Instance.Id]:
+		case <-kill:
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("Received kill signal for user '%s'", cd.Instance.Id)
 			client.Disconnect()
 
-			delete(w.clientPointer, cd.Instance.Id)
-			delete(w.myClientPointer, cd.Instance.Id)
+			// Só limpa/atualiza o estado se este ainda for o cliente atual da instância.
+			current := w.clientPointer[cd.Instance.Id] == client
+			if current {
+				delete(w.clientPointer, cd.Instance.Id)
+				delete(w.myClientPointer, cd.Instance.Id)
+			}
 
 			// Limpar cache de userInfo para esta instância
 			w.userInfoCache.Delete(cd.Instance.Token)
@@ -623,9 +666,23 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 
 			cd.Instance.Connected = false
 
-			err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
-			if err != nil {
-				w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
+			if current {
+				err := w.instanceRepository.UpdateConnected(cd.Instance.Id, cd.Instance.Connected, cd.Instance.DisconnectReason)
+				if err != nil {
+					w.loggerWrapper.GetLogger(cd.Instance.Id).LogError("[%s] Error updating instance: %s", cd.Instance.Id, err)
+				}
+			}
+
+			// Cramer: o kill vem de Disconnect/Logout da API, QR expirado, LoggedOut real
+			// ou ReconnectClient. Antes este ramo SEMPRE mandava "LoggedOut" e reiniciava o
+			// cliente: aparelho desvinculado virava um loop de QR a cada ~2 min, e uma
+			// reconexão simples aparecia no CRM como logout (canal preso em "reautorizar").
+			// Agora: LoggedOut só se o aparelho deixou de estar pareado, e nada de restart
+			// automático (ReconnectClient já sobe o cliente novo; os outros casos esperam
+			// um /instance/connect explícito).
+			if client.Store.ID != nil {
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Client stopped (device still paired); no LoggedOut, no auto-restart", cd.Instance.Id)
+				return
 			}
 
 			postMap := make(map[string]interface{})
@@ -660,11 +717,18 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 				go mycli.service.SendToGlobalQueues(postMap["event"].(string), values, mycli.userID)
 			}
 
-			// restart client
-			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Restarting client", cd.Instance.Id)
-			w.StartClient(cd)
+			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Client stopped (device unpaired); waiting for an explicit connect", cd.Instance.Id)
 			return
 		default:
+			// Canal substituído (ReconnectClient/StartInstance criou outro): esta
+			// goroutine é de um cliente antigo e deve sair sem tocar no novo.
+			if w.killChannel[cd.Instance.Id] != kill {
+				if w.clientPointer[cd.Instance.Id] != client && client.IsConnected() {
+					client.Disconnect()
+				}
+				w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Stale client goroutine exiting", cd.Instance.Id)
+				return
+			}
 			time.Sleep(1000 * time.Millisecond)
 		}
 	}
@@ -912,7 +976,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 		}
 	case *events.Connected, *events.PushNameSetting:
 		mycli.loggerWrapper.GetLogger(mycli.userID).LogInfo("[%s] events.Connected to Whatsapp for user '%s'", mycli.userID, mycli.WAClient.Store.PushName)
-		if len(mycli.WAClient.Store.PushName) > 0 {
+		// Número sem nome de perfil (PushName vazio) também precisa avisar o CRM e
+		// gravar connected=true; só o envio de presença exige PushName.
+		{
 			doWebhook = true
 			postMap["event"] = "Connected"
 
@@ -961,7 +1027,9 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 			// delivers messages to that active session and suppresses push notifications on
 			// the user's phone. When alwaysOnline is false we now send Unavailable instead.
 			var err error
-			if mycli.Instance.AlwaysOnline {
+			if len(mycli.WAClient.Store.PushName) == 0 {
+				mycli.loggerWrapper.GetLogger(mycli.userID).LogWarn("[%s] PushName vazio: presença não enviada", mycli.userID)
+			} else if mycli.Instance.AlwaysOnline {
 				go schedulePresenceUpdates(mycli)
 
 				err = mycli.WAClient.SendPresence(context.Background(), types.PresenceAvailable)
@@ -2045,6 +2113,12 @@ func (mycli *MyClient) myEventHandler(rawEvt interface{}) {
 
 		// Trigger instance restart via websocket-capable service (non-blocking)
 		go func(instanceID string) {
+			// Cramer: backoff para quedas em sequência (risco de ban). A 1ª queda numa
+			// janela de 10 min reconecta já; as seguintes esperam 15s, 30s, 60s... até 5 min.
+			if delay := reconnectBackoff(instanceID); delay > 0 {
+				mycli.loggerWrapper.GetLogger(instanceID).LogWarn("[%s] Disconnected again soon after a reconnect; waiting %s before reconnecting", instanceID, delay)
+				time.Sleep(delay)
+			}
 			mycli.loggerWrapper.GetLogger(instanceID).LogInfo("[%s] Disconnected detected, restarting instance", instanceID)
 			if err := mycli.service.ReconnectClient(instanceID); err != nil {
 				mycli.loggerWrapper.GetLogger(instanceID).LogError("[%s] Failed to restart instance: %v", instanceID, err)
